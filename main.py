@@ -1,649 +1,346 @@
-# advanced_yt_downloader.py
-# Requirements: pip install PySide6 yt-dlp requests
-# Make sure ffmpeg is available in PATH for merges / conversions.
+# very_simple_downloader.py
+# REQUIREMENTS: pip install PySide6 yt-dlp requests
+# Make sure ffmpeg is available in your system's PATH.
 
 import sys
 import os
-import json
 import threading
 import time
-import math
-from queue import Queue
-from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
 
 import requests
 import yt_dlp
 
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QComboBox, QCheckBox, QProgressBar, QTextEdit, QFileDialog, QTableWidget,
-    QTableWidgetItem, QAbstractItemView, QHeaderView, QMessageBox, QSpinBox,
-    QDialog, QFormLayout, QDialogButtonBox, QFrame
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QComboBox, QProgressBar, QTextEdit, QFileDialog, QMessageBox
 )
-from PySide6.QtGui import QPalette, QColor, QPixmap, QDragEnterEvent, QDropEvent
+from PySide6.QtGui import QPixmap
 from PySide6.QtCore import Qt, Signal, QObject
 
-SETTINGS_FILE = "ydl_gui_settings.json"
-
-# --------- Data structures ----------
-@dataclass
-class DownloadJob:
-    url: str
-    title: Optional[str] = None
-    thumbnail: Optional[str] = None
-    formats: List[Dict[str, Any]] = field(default_factory=list)
-    selected_format_id: Optional[str] = None
-    include_audio: bool = True
-    audio_only: bool = False
-    subtitles: bool = False
-    outtmpl: str = "%(title)s.%(ext)s"
-    status: str = "Queued"
-    progress: int = 0
-    speed: Optional[str] = None
-    eta: Optional[str] = None
-    size: Optional[str] = None
-    index_in_table: int = -1
-    resumed: bool = False  # used to mark resumed downloads
-
-
-# ---------- Signals object ----------
+# --- Worker Signals ---
+# Used to communicate from the download thread to the main UI thread
 class WorkerSignals(QObject):
-    progress = Signal(int, int, str, str)  # index, percent, speed, eta
-    status = Signal(int, str)  # index, status_text
-    finished = Signal(int, bool)  # index, success
+    progress = Signal(dict)
+    status = Signal(str)
+    finished = Signal(bool)
     log = Signal(str)
+    info_fetched = Signal(dict)
 
-
-# ---------- Worker (threaded) ----------
+# --- Download Worker Thread ---
 class DownloadWorker(threading.Thread):
-    def __init__(self, job: DownloadJob, index: int, settings: dict, signals: WorkerSignals):
+    def __init__(self, url, selected_format, download_dir, signals):
         super().__init__(daemon=True)
-        self.job = job
-        self.index = index
-        self.settings = settings
+        self.url = url
+        self.selected_format = selected_format
+        self.download_dir = download_dir
         self.signals = signals
         self._stop_requested = False
 
     def stop(self):
-        # best-effort stop: set flag; yt-dlp runs in same thread, so raising won't stop it immediately
         self._stop_requested = True
-        self.signals.log.emit(f"Requested stop for job {self.index} ({self.job.title})")
+        self.signals.log.emit("Stop request sent.")
 
     def run(self):
-        self.signals.status.emit(self.index, "Starting")
+        self.signals.status.emit("Starting download...")
+        
+        output_template = os.path.join(self.download_dir, "%(title)s.%(ext)s")
+
         ydl_opts = {
-            'outtmpl': os.path.join(self.settings.get('download_dir', '.'), self.job.outtmpl),
+            'outtmpl': output_template,
             'progress_hooks': [self._hook],
             'quiet': True,
             'no_warnings': True,
-            'noprogress': True,  # we use our hook
-            'continuedl': True,  # allow resuming
-            'retries': 3,
-            'cookiefile': self.settings.get('cookiesfile') or None,
+            'format': f"{self.selected_format}+bestaudio/best",
         }
-
-        # format logic
-        fmt = self.job.selected_format_id
-        if self.job.audio_only:
-            # download best audio and convert if requested format
-            audio_pref = self.settings.get('audio_format', 'mp3')
-            ydl_opts.update({
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': audio_pref,
-                    'preferredquality': '192',
-                }] if audio_pref else [],
-            })
-        else:
-            if fmt:
-                if self.job.include_audio:
-                    ydl_opts['format'] = f"{fmt}+bestaudio/best"
-                else:
-                    # video only
-                    ydl_opts['format'] = fmt
-            else:
-                # fallback to best
-                ydl_opts['format'] = 'bestvideo+bestaudio/best' if self.job.include_audio else 'bestvideo'
-
-        # subtitles
-        if self.job.subtitles:
-            ydl_opts.update({
-                'writesubtitles': True,
-                'writeautomaticsub': True,
-                'subtitleslangs': self.settings.get('sub_langs', ['en']),
-                'subtitlesformat': 'srt',
-            })
-
-        # proxy / user-agent
-        if self.settings.get('proxy'):
-            ydl_opts['proxy'] = self.settings['proxy']
-        if self.settings.get('user_agent'):
-            ydl_opts['user_agent'] = self.settings['user_agent']
-
-        # postprocessors for format conversion if requested by settings
-        # e.g., convert mp4->mp4 not needed. For audio we already used FFmpegExtractAudio.
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                # support playlists: yt-dlp will download all entries if given playlist URL.
-                # But our app adds playlist entries individually when adding to queue, so we still allow single URL.
-                # Run extraction+download
-                self.signals.log.emit(f"Worker {self.index}: downloading {self.job.url}")
-                ydl.download([self.job.url])
+                ydl.download([self.url])
+            
             if not self._stop_requested:
-                self.signals.progress.emit(self.index, 100, "0 B/s", "0s")
-                self.signals.status.emit(self.index, "Complete")
-                self.signals.finished.emit(self.index, True)
+                self.signals.finished.emit(True)
             else:
-                self.signals.status.emit(self.index, "Stopped")
-                self.signals.finished.emit(self.index, False)
+                self.signals.status.emit("Stopped by user")
+                self.signals.finished.emit(False)
         except Exception as e:
-            self.signals.log.emit(f"Worker {self.index} error: {repr(e)}")
-            self.signals.status.emit(self.index, f"Error: {str(e)}")
-            self.signals.finished.emit(self.index, False)
+            # Check if it's a user-initiated stop
+            if "Stopped by user" in str(e):
+                self.signals.status.emit("Stopped")
+            else:
+                self.signals.log.emit(f"Error: {str(e)}")
+                self.signals.status.emit("Error")
+            self.signals.finished.emit(False)
 
     def _hook(self, d):
         if self._stop_requested:
-            # attempt to abort by raising an exception yt-dlp will propagate
             raise yt_dlp.utils.DownloadError("Stopped by user")
-        status = d.get('status')
-        if status == 'downloading':
-            # percent
-            p = d.get('_percent_str', '0.0%').strip().replace('%', '')
-            try:
-                perc = int(float(p))
-            except:
-                perc = 0
-            speed = d.get('_speed_str', '0 B/s')
-            eta = d.get('_eta_str', '??s')
-            self.signals.progress.emit(self.index, perc, speed, eta)
-            self.signals.status.emit(self.index, "Downloading")
-        elif status == 'finished':
-            self.signals.status.emit(self.index, "Merging / finalizing")
-        elif status == 'error':
-            self.signals.status.emit(self.index, "Error")
+        
+        if d['status'] == 'downloading':
+            self.signals.progress.emit(d)
+        elif d['status'] == 'finished':
+            self.signals.status.emit("Merging files...")
 
-
-# -------------- Settings dialog ----------------
-class SettingsDialog(QDialog):
-    def __init__(self, parent, settings):
-        super().__init__(parent)
-        self.setWindowTitle("Settings")
-        self.settings = settings
-        layout = QFormLayout()
-        self.download_dir_btn = QPushButton(self.settings.get('download_dir', os.getcwd()))
-        self.download_dir_btn.clicked.connect(self.choose_dir)
-        layout.addRow("Download Directory", self.download_dir_btn)
-
-        self.concurrent_spin = QSpinBox()
-        self.concurrent_spin.setRange(1, 8)
-        self.concurrent_spin.setValue(self.settings.get('concurrent', 2))
-        layout.addRow("Concurrent downloads", self.concurrent_spin)
-
-        self.audio_combo = QComboBox()
-        self.audio_combo.addItems(['mp3', 'aac', 'wav', 'm4a', 'none'])
-        cur_audio = self.settings.get('audio_format', 'mp3')
-        idx = self.audio_combo.findText(cur_audio) if cur_audio in ['mp3', 'aac', 'wav', 'm4a', 'none'] else 0
-        self.audio_combo.setCurrentIndex(idx if idx>=0 else 0)
-        layout.addRow("Default audio format", self.audio_combo)
-
-        self.proxy_input = QLineEdit(self.settings.get('proxy',''))
-        layout.addRow("Proxy (http://...)", self.proxy_input)
-
-        self.user_agent_input = QLineEdit(self.settings.get('user_agent',''))
-        layout.addRow("User-Agent", self.user_agent_input)
-
-        self.cookies_input = QLineEdit(self.settings.get('cookiesfile',''))
-        b = QPushButton("Browse")
-        b.clicked.connect(self.browse_cookies)
-        h = QHBoxLayout()
-        h.addWidget(self.cookies_input); h.addWidget(b)
-        layout.addRow("Cookies file", h)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-        self.setLayout(layout)
-
-    def choose_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select download directory", self.download_dir_btn.text())
-        if d:
-            self.download_dir_btn.setText(d)
-
-    def browse_cookies(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Select cookies file", "", "Cookies Files (*.txt *.cookies);;All Files (*)")
-        if f:
-            self.cookies_input.setText(f)
-
-    def accept(self):
-        self.settings['download_dir'] = self.download_dir_btn.text()
-        self.settings['concurrent'] = int(self.concurrent_spin.value())
-        sel_audio = self.audio_combo.currentText()
-        self.settings['audio_format'] = sel_audio if sel_audio!='none' else ''
-        self.settings['proxy'] = self.proxy_input.text().strip() or ''
-        self.settings['user_agent'] = self.user_agent_input.text().strip() or ''
-        self.settings['cookiesfile'] = self.cookies_input.text().strip() or ''
-        super().accept()
-
-
-# -------------- Main Window ----------------
-class AdvancedDownloader(QWidget):
+# --- Main Application Window ---
+class DownloaderApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Advanced YouTube Downloader (PySide6) — Far Too Advanced")
-        self.setFixedSize(980, 640)
-        self.load_settings()
-        self.jobs: List[DownloadJob] = []
-        self.queue = Queue()
-        self.active_workers: Dict[int, DownloadWorker] = {}
+        self.setWindowTitle("Simple Video Downloader")
+        self.resize(700, 550)
+        
+        # --- App State ---
+        self.download_dir = os.getcwd()
+        self.current_video_info = None
+        self.active_worker = None
+
+        # --- Signals ---
         self.signals = WorkerSignals()
+        self.signals.info_fetched.connect(self.on_info_fetched)
         self.signals.progress.connect(self.on_progress)
         self.signals.status.connect(self.on_status)
         self.signals.finished.connect(self.on_finished)
         self.signals.log.connect(self.append_log)
+        
         self.setup_ui()
-        self.check_workers_timer = self.start_check_timer()
-
-    def load_settings(self):
-        if os.path.exists(SETTINGS_FILE):
-            try:
-                with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                    self.settings = json.load(f)
-            except:
-                self.settings = {}
-        else:
-            self.settings = {}
-        # defaults
-        if 'download_dir' not in self.settings:
-            self.settings['download_dir'] = os.getcwd()
-        if 'concurrent' not in self.settings:
-            self.settings['concurrent'] = 2
-        if 'audio_format' not in self.settings:
-            self.settings['audio_format'] = 'mp3'
-
-    def save_settings(self):
-        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(self.settings, f, indent=2)
+        self.reset_ui_state()
 
     def setup_ui(self):
-        # Dark palette
-        palette = QPalette()
-        palette.setColor(QPalette.Window, QColor("#0F0F10"))
-        palette.setColor(QPalette.WindowText, QColor("#EAEAEA"))
-        palette.setColor(QPalette.Base, QColor("#121212"))
-        palette.setColor(QPalette.AlternateBase, QColor("#1A1A1A"))
-        palette.setColor(QPalette.Text, QColor("#DDDDDD"))
-        palette.setColor(QPalette.Button, QColor("#1F1F1F"))
-        palette.setColor(QPalette.ButtonText, QColor("#FFFFFF"))
-        self.setPalette(palette)
+        """Create and lay out all the widgets."""
+        main_layout = QVBoxLayout(self)
 
-        main = QVBoxLayout()
-        topbar = QHBoxLayout()
-
+        # --- URL Input ---
+        url_layout = QHBoxLayout()
         self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Paste YouTube / Playlist URL, or drag & drop here...")
-        self.url_input.returnPressed.connect(self.handle_add)
-        add_btn = QPushButton("Add to Queue")
-        add_btn.clicked.connect(self.handle_add)
-        fetch_btn = QPushButton("Fetch & Preview")
-        fetch_btn.clicked.connect(self.handle_preview)
+        self.url_input.setPlaceholderText("Paste a video URL here and press Enter")
+        self.url_input.returnPressed.connect(self.fetch_video_info)
+        self.fetch_button = QPushButton("Fetch Info")
+        self.fetch_button.clicked.connect(self.fetch_video_info)
+        url_layout.addWidget(QLabel("URL:"))
+        url_layout.addWidget(self.url_input)
+        url_layout.addWidget(self.fetch_button)
+        main_layout.addLayout(url_layout)
 
-        settings_btn = QPushButton("Settings")
-        settings_btn.clicked.connect(self.open_settings)
-        start_btn = QPushButton("Start Queue")
-        start_btn.clicked.connect(self.start_queue)
-        stop_all_btn = QPushButton("Stop All")
-        stop_all_btn.clicked.connect(self.stop_all)
-
-        topbar.addWidget(self.url_input)
-        topbar.addWidget(add_btn)
-        topbar.addWidget(fetch_btn)
-        topbar.addWidget(settings_btn)
-        topbar.addWidget(start_btn)
-        topbar.addWidget(stop_all_btn)
-
-        main.addLayout(topbar)
-
-        # Table for queue
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(["Title", "Res/Format", "Audio", "Progress", "Speed/ETA", "Status", "Actions"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        for c in range(1,7):
-            self.table.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.cellClicked.connect(self.on_table_click)
-
-        main.addWidget(self.table, stretch=6)
-
-        # bottom: thumbnail + log + controls
-        bottom = QHBoxLayout()
-
-        preview_frame = QFrame()
-        preview_layout = QVBoxLayout()
-        preview_frame.setLayout(preview_layout)
-        preview_label = QLabel("Thumbnail Preview")
-        preview_label.setAlignment(Qt.AlignCenter)
-        self.thumbnail_label = QLabel()
+        # --- Video Info Display ---
+        self.title_label = QLabel("Video title will appear here")
+        self.title_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+        self.thumbnail_label = QLabel("Thumbnail")
         self.thumbnail_label.setFixedSize(320, 180)
-        self.thumbnail_label.setStyleSheet("background: #141414; border: 1px solid #232323;")
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
-        preview_layout.addWidget(preview_label)
-        preview_layout.addWidget(self.thumbnail_label)
-        bottom.addWidget(preview_frame)
+        self.thumbnail_label.setStyleSheet("background-color: #E0E0E0; border: 1px solid #C0C0C0;")
 
-        log_frame = QFrame()
-        log_layout = QVBoxLayout()
-        log_frame.setLayout(log_layout)
-        log_label = QLabel("Log")
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setFixedHeight(180)
-        log_layout.addWidget(log_label)
-        log_layout.addWidget(self.log)
-        bottom.addWidget(log_frame, stretch=1)
+        info_layout = QHBoxLayout()
+        info_layout.addWidget(self.thumbnail_label)
+        
+        download_options_layout = QVBoxLayout()
+        download_options_layout.addWidget(self.title_label)
+        
+        # --- Format Selector ---
+        self.format_combo = QComboBox()
+        download_options_layout.addWidget(QLabel("Choose Quality:"))
+        download_options_layout.addWidget(self.format_combo)
+        
+        self.download_button = QPushButton("Download")
+        self.download_button.clicked.connect(self.start_download)
+        download_options_layout.addWidget(self.download_button)
+        download_options_layout.addStretch()
+        
+        info_layout.addLayout(download_options_layout, stretch=1)
+        main_layout.addLayout(info_layout)
 
-        right_controls = QVBoxLayout()
-        # Quick options
-        opts_label = QLabel("Quick Options")
-        self.audio_only_cb = QCheckBox("Default: Audio-only")
-        self.include_audio_cb = QCheckBox("Default: Include audio in videos")
-        self.include_audio_cb.setChecked(True)
-        choose_dir_btn = QPushButton(f"Save Dir: {self.settings.get('download_dir')}")
-        choose_dir_btn.clicked.connect(self.choose_dir)
-        clear_done_btn = QPushButton("Clear Completed")
-        clear_done_btn.clicked.connect(self.clear_completed)
-        self.concurrent_spin = QSpinBox()
-        self.concurrent_spin.setRange(1, 8)
-        self.concurrent_spin.setValue(self.settings.get('concurrent', 2))
-        right_controls.addWidget(opts_label)
-        right_controls.addWidget(self.audio_only_cb)
-        right_controls.addWidget(self.include_audio_cb)
-        right_controls.addWidget(choose_dir_btn)
-        right_controls.addWidget(QLabel("Concurrent downloads"))
-        right_controls.addWidget(self.concurrent_spin)
-        right_controls.addWidget(clear_done_btn)
-        right_controls.addStretch()
-        bottom.addLayout(right_controls)
+        # --- Progress and Status ---
+        self.progress_bar = QProgressBar()
+        self.status_label = QLabel("Status: Idle")
+        main_layout.addWidget(self.progress_bar)
+        main_layout.addWidget(self.status_label)
 
-        main.addLayout(bottom)
+        # --- Log and Directory Controls ---
+        bottom_layout = QHBoxLayout()
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setFixedHeight(100)
+        
+        dir_layout = QVBoxLayout()
+        self.dir_label = QLabel(f"Saving to: {self.download_dir}")
+        self.dir_label.setWordWrap(True)
+        change_dir_button = QPushButton("Change Directory")
+        change_dir_button.clicked.connect(self.change_directory)
+        dir_layout.addWidget(self.dir_label)
+        dir_layout.addWidget(change_dir_button)
+        
+        bottom_layout.addWidget(self.log_box, stretch=1)
+        bottom_layout.addLayout(dir_layout)
+        main_layout.addLayout(bottom_layout)
 
-        self.setLayout(main)
+    def reset_ui_state(self):
+        """Reset the UI to its initial state, ready for a new URL."""
+        self.url_input.setEnabled(True)
+        self.fetch_button.setEnabled(True)
+        self.download_button.setEnabled(False)
+        self.title_label.setText("Video title will appear here")
+        self.thumbnail_label.setText("Thumbnail")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0%")
+        self.status_label.setText("Status: Idle")
+        self.format_combo.clear()
+        self.current_video_info = None
 
-        # drag and drop
-        self.setAcceptDrops(True)
-
-        # small internal references
-        self.choose_dir_btn = choose_dir_btn
-
-    # Drag/drop handlers
-    def dragEnterEvent(self, e: QDragEnterEvent):
-        if e.mimeData().hasUrls() or e.mimeData().hasText():
-            e.acceptProposedAction()
-
-    def dropEvent(self, e: QDropEvent):
-        if e.mimeData().hasUrls():
-            urls = e.mimeData().urls()
-            if urls:
-                text = '\n'.join([u.toString() for u in urls])
-                self.url_input.setText(text)
-        elif e.mimeData().hasText():
-            self.url_input.setText(e.mimeData().text())
-
-    # ---------- UI actions ----------
-    def handle_add(self):
-        raw = self.url_input.text().strip()
-        if not raw:
-            self.append_log("⚠️ Paste a URL or drop one in.")
-            return
-        # can be multiple lines
-        for line in raw.splitlines():
-            url = line.strip()
-            if url:
-                self.add_url_to_queue(url, default_audio_only=self.audio_only_cb.isChecked(),
-                                      default_include_audio=self.include_audio_cb.isChecked())
-        self.url_input.clear()
-
-    def handle_preview(self):
+    # --- Core Methods ---
+    def fetch_video_info(self):
+        """Starts a thread to fetch video information."""
         url = self.url_input.text().strip()
         if not url:
-            self.append_log("⚠️ Paste a URL for preview.")
+            QMessageBox.warning(self, "Input Error", "Please enter a URL.")
             return
-        self.append_log("🔎 Fetching info...")
-        threading.Thread(target=self._fetch_info_thread, args=(url, True), daemon=True).start()
 
-    def add_url_to_queue(self, url: str, default_audio_only=False, default_include_audio=True):
-        threading.Thread(target=self._fetch_info_thread, args=(url, False, default_audio_only, default_include_audio), daemon=True).start()
+        self.status_label.setText("Status: Fetching video information...")
+        self.url_input.setEnabled(False)
+        self.fetch_button.setEnabled(False)
+        
+        # Run the network request in a separate thread
+        threading.Thread(target=self._fetch_info_thread, args=(url,), daemon=True).start()
 
-    def _fetch_info_thread(self, url: str, preview_only=False, default_audio_only=False, default_include_audio=True):
-        opts = {'quiet': True, 'no_warnings': True}
+    def _fetch_info_thread(self, url):
+        """The actual fetching logic that runs in the background."""
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
                 info = ydl.extract_info(url, download=False)
+            self.signals.info_fetched.emit(info)
         except Exception as e:
-            self.append_log(f"Error fetching info: {e}")
+            self.signals.log.emit(f"Could not fetch info: {str(e)}")
+            self.signals.status.emit("Error fetching info. Check URL and try again.")
+            self.signals.info_fetched.emit(None) # Signal failure
+
+    def start_download(self):
+        """Starts the download worker thread."""
+        if not self.current_video_info:
+            QMessageBox.critical(self, "Error", "No video info available to start download.")
+            return
+            
+        selected_format_id = self.format_combo.currentData()
+        if not selected_format_id:
+            QMessageBox.warning(self, "Input Error", "Please select a quality.")
             return
 
-        # playlist handling
-        entries = []
-        if 'entries' in info and info.get('entries'):
-            # playlist
-            for e in info['entries']:
-                if not e:
-                    continue
-                entries.append(e)
-            self.append_log(f"Playlist detected: {info.get('title','(playlist)')} — {len(entries)} items")
-        else:
-            entries.append(info)
+        self.download_button.setText("Stop")
+        self.download_button.clicked.disconnect()
+        self.download_button.clicked.connect(self.stop_download)
+        
+        self.fetch_button.setEnabled(False)
+        self.format_combo.setEnabled(False)
 
-        if preview_only:
-            # just show top entry details
-            top = entries[0]
-            title = top.get('title') or top.get('id')
-            thumb = top.get('thumbnail')
-            fmt_list = top.get('formats', [])
-            # extract unique video formats with height
-            video_formats = sorted(
-                [f for f in fmt_list if f.get('vcodec') != 'none' and f.get('height')],
-                key=lambda x: x.get('height', 0), reverse=True
-            )
-            self.append_log(f"Preview: {title} | {len(video_formats)} video formats found")
-            if thumb:
-                self._load_thumbnail_from_url(thumb)
+        self.active_worker = DownloadWorker(
+            url=self.current_video_info['webpage_url'],
+            selected_format=selected_format_id,
+            download_dir=self.download_dir,
+            signals=self.signals
+        )
+        self.active_worker.start()
+
+    def stop_download(self):
+        """Stops the currently active download worker."""
+        if self.active_worker:
+            self.active_worker.stop()
+            self.download_button.setEnabled(False) # Prevent multiple clicks
+            self.status_label.setText("Status: Stopping...")
+
+    def change_directory(self):
+        """Opens a dialog to select a new download directory."""
+        directory = QFileDialog.getExistingDirectory(self, "Select Download Directory", self.download_dir)
+        if directory:
+            self.download_dir = directory
+            self.dir_label.setText(f"Saving to: {self.download_dir}")
+            self.append_log(f"Save directory set to: {directory}")
+
+    # --- Signal Handlers (slots) ---
+    def on_info_fetched(self, info):
+        """Handles the result from the info fetching thread."""
+        if info is None: # Handle failure
+            self.reset_ui_state()
+            self.url_input.clear()
             return
 
-        # add each entry to queue
-        for entry in entries:
-            job = DownloadJob(url=entry.get('webpage_url') or entry.get('url') or url)
-            job.title = entry.get('title') or entry.get('id')
-            job.thumbnail = entry.get('thumbnail')
-            # collect formats: present human-friendly label
-            fmts = entry.get('formats', [])
-            video_formats = sorted([f for f in fmts if f.get('vcodec') != 'none' and f.get('height')],
-                                   key=lambda x: (x.get('height') or 0, x.get('ext') or ''), reverse=True)
-            job.formats = video_formats
-            # choose default best
-            if video_formats:
-                job.selected_format_id = video_formats[0].get('format_id')
-            job.include_audio = default_include_audio
-            job.audio_only = default_audio_only
-            job.subtitles = False
-            job.outtmpl = "%(title)s.%(ext)s"
-            self.jobs.append(job)
-            self.add_job_to_table(job)
-            self.append_log(f"Queued: {job.title}")
-        self.save_settings()
+        self.current_video_info = info
+        self.title_label.setText(info.get('title', 'N/A'))
+        self.format_combo.clear()
+        
+        # Filter for video formats and populate the dropdown
+        video_formats = [f for f in info.get('formats', []) if f.get('vcodec') != 'none' and f.get('height')]
+        video_formats.sort(key=lambda f: f.get('height', 0), reverse=True)
 
-    def add_job_to_table(self, job: DownloadJob):
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        job.index_in_table = row
+        for f in video_formats:
+            label = f"{f.get('height')}p ({f.get('ext')})"
+            self.format_combo.addItem(label, userData=f['format_id'])
+        
+        self.download_button.setEnabled(True)
+        self.status_label.setText("Status: Ready to download.")
+        
+        # Load thumbnail in a separate thread
+        thumb_url = info.get('thumbnail')
+        if thumb_url:
+            threading.Thread(target=self._load_thumbnail, args=(thumb_url,), daemon=True).start()
 
-        title_item = QTableWidgetItem(job.title or "Unknown")
-        fmt_item = QTableWidgetItem(self._fmt_label(job))
-        audio_item = QTableWidgetItem("Audio-only" if job.audio_only else ("Audio" if job.include_audio else "No audio"))
-        prog_item = QTableWidgetItem("0%")
-        speed_item = QTableWidgetItem("-")
-        status_item = QTableWidgetItem(job.status)
-        actions_item = QTableWidgetItem("Pause / Remove")
-
-        self.table.setItem(row, 0, title_item)
-        self.table.setItem(row, 1, fmt_item)
-        self.table.setItem(row, 2, audio_item)
-        self.table.setItem(row, 3, prog_item)
-        self.table.setItem(row, 4, speed_item)
-        self.table.setItem(row, 5, status_item)
-        self.table.setItem(row, 6, actions_item)
-
-    def _fmt_label(self, job: DownloadJob):
-        if job.audio_only:
-            return "Audio (auto)"
-        if job.selected_format_id and job.formats:
-            fm = next((f for f in job.formats if f.get('format_id') == job.selected_format_id), None)
-            if fm:
-                return f"{fm.get('height','?')}p · {fm.get('ext','')}"
-        return "Auto"
-
-    def _load_thumbnail_from_url(self, url: str):
+    def _load_thumbnail(self, url):
+        """Loads image from URL and sets it on the label."""
         try:
-            r = requests.get(url, timeout=8)
-            r.raise_for_status()
-            img = QPixmap()
-            img.loadFromData(r.content)
-            scaled = img.scaled(self.thumbnail_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.thumbnail_label.setPixmap(scaled)
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            pixmap = QPixmap()
+            pixmap.loadFromData(response.content)
+            scaled_pixmap = pixmap.scaled(self.thumbnail_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.thumbnail_label.setPixmap(scaled_pixmap)
         except Exception as e:
-            self.append_log(f"Failed to load thumbnail: {e}")
+            self.signals.log.emit(f"Failed to load thumbnail: {e}")
+            self.thumbnail_label.setText("No Thumbnail")
 
-    def open_settings(self):
-        dlg = SettingsDialog(self, dict(self.settings))
-        if dlg.exec():
-            # settings dialog changed self.settings in its accept
-            self.settings.update(dlg.settings)
-            self.choose_dir_btn.setText(f"Save Dir: {self.settings.get('download_dir')}")
-            self.concurrent_spin.setValue(self.settings.get('concurrent', 2))
-            self.save_settings()
-            self.append_log("Settings saved")
+    def on_progress(self, progress_dict):
+        """Updates the progress bar."""
+        try:
+            percent_str = progress_dict.get('_percent_str', '0%').strip('%')
+            percent = int(float(percent_str))
+            speed = progress_dict.get('_speed_str', 'N/A')
+            self.progress_bar.setValue(percent)
+            self.progress_bar.setFormat(f"{percent}% ({speed})")
+            self.status_label.setText("Status: Downloading...")
+        except (ValueError, TypeError):
+            pass
 
-    def choose_dir(self):
-        d = QFileDialog.getExistingDirectory(self, "Select download directory", self.settings.get('download_dir', os.getcwd()))
-        if d:
-            self.settings['download_dir'] = d
-            self.choose_dir_btn.setText(f"Save Dir: {d}")
-            self.save_settings()
+    def on_status(self, text):
+        """Updates the status label."""
+        self.status_label.setText(f"Status: {text}")
 
-    def clear_completed(self):
-        # remove rows where status == Complete
-        rows_to_remove = []
-        for row in range(self.table.rowCount()):
-            status = self.table.item(row,5).text()
-            if status.lower().startswith("complete") or status.lower().startswith("error") or status.lower().startswith("stopped"):
-                rows_to_remove.append(row)
-        for r in sorted(rows_to_remove, reverse=True):
-            self.table.removeRow(r)
-            # remove job from jobs list if index matches
-            self.jobs = [j for j in self.jobs if j.index_in_table != r]
-        self.append_log("Cleared completed/errored items from UI.")
+    def on_finished(self, success):
+        """Called when the download worker thread finishes."""
+        self.status_label.setText("Status: Download Complete!" if success else "Status: Download Failed or Stopped.")
+        self.progress_bar.setValue(100)
+        self.progress_bar.setFormat("Done" if success else "Failed")
+        
+        self.active_worker = None
+        
+        # Reset the download button
+        self.download_button.setText("Download")
+        try:
+            self.download_button.clicked.disconnect()
+        except RuntimeError:
+            pass # Already disconnected
+        self.download_button.clicked.connect(self.start_download)
+        self.download_button.setEnabled(False) # User must fetch a new video
+        
+        # Re-enable UI for next video
+        self.fetch_button.setEnabled(True)
+        self.url_input.setEnabled(True)
+        self.url_input.clear()
+        self.format_combo.setEnabled(True)
 
-    def start_queue(self):
-        # copy current UI states into jobs and enqueue
-        self.settings['concurrent'] = int(self.concurrent_spin.value())
-        self.save_settings()
+        if success:
+            QMessageBox.information(self, "Success", "Video downloaded successfully!")
 
-        # enqueue any jobs that are queued or stopped (but not currently active)
-        for i, job in enumerate(self.jobs):
-            if job.status in ("Queued", "Stopped", "Error"):
-                job.status = "Queued"
-                self.queue.put((i, job))
-                self.append_log(f"Enqueued job {i}: {job.title}")
-
-        # spin up workers up to concurrency
-        self._fill_workers()
-
-    def _fill_workers(self):
-        while len(self.active_workers) < self.settings.get('concurrent', 2) and not self.queue.empty():
-            idx, job = self.queue.get()
-            # ensure index matches table index mapping
-            worker = DownloadWorker(job=job, index=idx, settings=self.settings, signals=self.signals)
-            self.active_workers[idx] = worker
-            job.status = "Starting"
-            self.table.setItem(job.index_in_table, 5, QTableWidgetItem(job.status))
-            worker.start()
-            self.append_log(f"Worker started for {job.title} (idx={idx})")
-
-    def stop_all(self):
-        self.append_log("Stopping all active downloads (best-effort)...")
-        for idx, worker in list(self.active_workers.items()):
-            worker.stop()
-
-    # ---------- Worker signal handlers ----------
-    def on_progress(self, index: int, percent: int, speed: str, eta: str):
-        # find job by index
-        job = self.jobs[index] if 0 <= index < len(self.jobs) else None
-        if not job:
-            return
-        job.progress = percent
-        job.speed = speed
-        job.eta = eta
-        # update table
-        if job.index_in_table >= 0 and job.index_in_table < self.table.rowCount():
-            self.table.setItem(job.index_in_table, 3, QTableWidgetItem(f"{percent}%"))
-            self.table.setItem(job.index_in_table, 4, QTableWidgetItem(f"{speed} · {eta}"))
-
-    def on_status(self, index: int, status_text: str):
-        job = self.jobs[index] if 0 <= index < len(self.jobs) else None
-        if not job:
-            return
-        job.status = status_text
-        if job.index_in_table >=0 and job.index_in_table < self.table.rowCount():
-            self.table.setItem(job.index_in_table, 5, QTableWidgetItem(status_text))
-
-    def on_finished(self, index: int, success: bool):
-        # cleanup worker and try to start next queued
-        if index in self.active_workers:
-            del self.active_workers[index]
-        job = self.jobs[index] if 0 <= index < len(self.jobs) else None
-        if job:
-            job.status = "Complete" if success else "Failed/Stopped"
-            if job.index_in_table >=0 and job.index_in_table < self.table.rowCount():
-                self.table.setItem(job.index_in_table, 5, QTableWidgetItem(job.status))
-        self.append_log(f"Job {index} finished: {success}")
-        # try to fill more workers
-        self._fill_workers()
-
-    # ---------- helpers ----------
-    def append_log(self, text: str):
+    def append_log(self, text):
+        """Adds a timestamped message to the log box."""
         ts = time.strftime("%H:%M:%S")
-        self.log.append(f"[{ts}] {text}")
-
-    def on_table_click(self, row, col):
-        # show thumbnail of clicked row's job
-        try:
-            job = next((j for j in self.jobs if j.index_in_table == row), None)
-            if job and job.thumbnail:
-                self._load_thumbnail_from_url(job.thumbnail)
-        except Exception as e:
-            self.append_log(f"Table click error: {e}")
-
-    def start_check_timer(self):
-        # simple timer using thread to periodically ensure worker fill
-        def loop():
-            while True:
-                time.sleep(1.0)
-                # ensure master supports more workers if queue not empty
-                if not self.queue.empty():
-                    self._fill_workers()
-        t = threading.Thread(target=loop, daemon=True)
-        t.start()
-        return t
-
+        self.log_box.append(f"[{ts}] {text}")
 
 def main():
     app = QApplication(sys.argv)
-    win = AdvancedDownloader()
+    win = DownloaderApp()
     win.show()
     sys.exit(app.exec())
 
